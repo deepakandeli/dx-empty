@@ -26,15 +26,18 @@ do
     if [ -f "$file" ]; then
         # Check if the file contains the keyword "@isTest "
         if grep -q "@isTest " "$file"; then
-            # Append the file name to the variable, separated by a comma
-            file_names="${file_names}${file_names:+, }$(basename "$file")"
+            # Append the file name (without extension) to the variable, separated by a comma
+            file_names="${file_names}${file_names:+, }$(basename "$file" | cut -f1 -d'.')"
         fi
     fi
 done
 
+
 # Display the file names containing the keyword
 if [ -n "$file_names" ]; then
-    echo "$file_names"
+    # Surround the final comma-separated list of file names with double quotes
+    final_string="\"$file_names\""
+    echo "$final_string"
 else
     echo ""
 fi
