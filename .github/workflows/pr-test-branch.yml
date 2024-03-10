@@ -1,0 +1,176 @@
+# Unique name for this workflow
+name: Validate PR on test branch
+
+# Definition when the workflow should run
+on:
+    # The workflow will run whenever an event happens on a pull request
+    pull_request:
+      # The events are that a PR is opened, or when a commit is pushed
+      # to a branch that has an existing pull request
+      types: [opened, synchronize]
+      # The branches filter allows to specify that this workflow should only
+      # run if the branch name is "develop". This way we prevent this workflow
+      # from running when PRs are opened on other branches
+      branches: [ test ]
+      # We only care about changes to the force-app directory, which is the
+      # root directory of the sfdx project. This prevents the job from running
+      # when changing non-salesforce files (like this yml file).
+      paths:
+        - 'force-app/**'
+        - 'scripts/**'
+        - 'svmxc/**'
+            
+
+# Jobs to be executed when the above conditions are met
+jobs:
+    # This is the name of the job. You can give it whatever name you want
+    validate-deployment-on-test-org:
+        # As mentioned in the blog post, this job runs inside a VM. Here we
+        # can specify which OS this VM should run on. 
+        # In this case, we are going to run our commands on the latest version
+        # of ubuntu
+        runs-on: ubuntu-latest
+        if: ${{ github.actor != 'dependabot[bot]' }}
+        steps:
+            # Now we install nodejs in the VM, and specify version 14
+            - uses: actions/setup-node@v3
+              with:
+                node-version: '14'
+
+            # The idea is that the VM can access your remote repository
+            # because your repository is an sfdx project.
+            # This is a default action that allows us to enter the root 
+            # directory of the repository
+
+            # Make sure to specify fetch-depth:0. This allows us to
+            # access previous commits that have been pushed to the repository.
+
+            # We'll need this later when we try to figure out which metadata has 
+            # changed between commits, so that we can only deploy that metadata
+            # to the destination org
+
+            - name: 'Checkout source code'
+              uses: actions/checkout@v3
+              with:
+                fetch-depth: 0
+
+            # Now Install Salesforce CLI
+            - name: 'Install Salesforce CLI'
+              run: |
+                  wget https://developer.salesforce.com/media/salesforce-cli/sfdx/channels/stable/sfdx-linux-x64.tar.xz
+                  mkdir ~/sfdx
+                  tar xJf sfdx-linux-x64.tar.xz -C ~/sfdx --strip-components 1
+                  echo "$HOME/sfdx/bin" >> $GITHUB_PATH
+                  ~/sfdx/bin/sfdx version
+
+            # Then we install the SFDX-Git-Delta plugin - https://github.com/scolladon/sfdx-git-delta
+            # This is an awesome plugin that allows us to extract a package.xml with the metadata
+            # that has changed between commits. I highly recommend going over the github readme 
+            # for more information on how this works.
+
+            - name: 'Installing sfdx git delta'
+              run: | 
+                  echo y | sfdx plugins:install sfdx-git-delta
+                  sfdx plugins 
+
+            # Prior to setting up this workflow, you have to create a Github Secret
+            # that contains the sfdx url of the integration/qa org.
+
+            # The steps to generate the url are here 
+            # https://developer.salesforce.com/docs/atlas.en-us.sfdx_cli_reference.meta/sfdx_cli_reference/cli_reference_auth_sfdxurl.htm
+
+            # This URL can then be used with the sfdx auth:sfdxurl:store to authenticate
+            # the sfdx project in the repositry, against the org from which the URL
+            # was generated from. This works just like that, there's no need to create
+            # connected apps or any else. 
+
+            # The URL is stored in the Github Secret named SFDX_INTEGRATION_URL
+            # so here we store the URL into a text file
+            - name: 'Populate auth file with SFDX_URL secret of integration org'
+              shell: bash
+              run: |
+                  echo ${{ secrets.SFDX_INTEGRATION_URL}} > ./SFDX_INTEGRATION_URL.txt
+
+            # Authenticate to org using the URL stored in the text file
+            - name: 'Authenticate to Integration Org'
+              run: sfdx auth:sfdxurl:store -f ./SFDX_INTEGRATION_URL.txt -s -a integration
+
+            # We use SFDX Git Delta to create a directory with only the metadata that has changed.
+            # this allows us to deploy only those changes, as opposed to deploying the entire branch. 
+            # This helps reducing deployment times
+            - name: 'Create delta packages for new, modified or deleted metadata'
+              run: | 
+                  mkdir changed-sources
+                  sfdx sgd:source:delta --to "HEAD" --from "HEAD^" --output changed-sources/ --generate-delta --source force-app/ 
+
+            # We use the delta changes identified above in the changed-sources/ folder and identify the Test classes available for execution.
+            # Prior to checking for the test classes in the delta, one has to also check whether Apex test class is required to be identified through RUN_APEX_TEST variable.
+            # If the variable is set to TRUE, proceed to identify the test classes else execute deployment without test classes
+            - name: 'Read RUN_APEX_TEST Body'
+              run: |
+                echo ${{vars.RUN_APEX_TEST}}
+                if [ "${{vars.RUN_APEX_TEST}}" == "TRUE" ]; then
+                pwd
+                ls -l changed-sources/
+                chmod -R a+rwx scripts
+                #ls -l
+                chmod 755 scripts/findtestclasses.sh 
+                ls -l force-app/main/default/classes
+                #cat scripts/findtestclasses.sh
+                scripts/findtestclasses.sh changed-sources/force-app/main/default/classes > ./testsToRun.txt
+                TESTS=$(cat testsToRun.txt)
+                echo "APEX_TESTS=$TESTS" >> $GITHUB_ENV
+                fi                  
+
+
+            # We do a check-only deploy and we only run the tests specified in the PR
+            # If the env variable does not equal 'all', we know that there is a list of
+            # tests that can be run
+
+            - name: 'Check-only deploy delta changes - run specified tests'
+              if: ${{ vars.RUN_APEX_TEST == 'TRUE' && env.APEX_TESTS != 'all' && env.APEX_TESTS != '' }}
+              run: |
+                  echo ${{env.APEX_TESTS}}
+                  sfdx force:source:deploy -p "changed-sources/force-app" --checkonly --testlevel RunSpecifiedTests --runtests ${{env.APEX_TESTS}} --json
+                 
+            - name: 'Check-only deploy delta changes - without running specified tests'
+              if: ${{ vars.RUN_APEX_TEST == 'FALSE' || env.APEX_TESTS == ''}}
+              run: |
+                  echo ${{vars.RUN_APEX_TEST}}
+                  sfdx force:source:deploy -p "changed-sources/force-app" --checkonly --json   
+
+            # If the env variable equals all, we run all tests
+            - name: 'Check-only deploy delta changes - run all tests'
+              if: ${{ env.APEX_TESTS == 'all' }}
+              run: |
+                  sfdx force:source:deploy -p "changed-sources/force-app" --checkonly --testlevel RunLocalTests  --json
+
+            - name: 'Deploy destructive changes (if any)'
+              run: sfdx force:mdapi:deploy -d "changed-sources/destructiveChanges" --checkonly --ignorewarnings
+
+            #Then ServiceMax installation - we install the SFDX Servicemax plugin - https://help.servicemax.com/articles/#!migration-tool/installing-the-sfdx-plugin
+            #- name: 'Installing sfdx servicemax plugin'
+              #run: | 
+                  #echo y | sfdx plugins:install svmxc-sfdx
+                  #sfdx plugins
+            #deploy everything inside ./svmxc folder
+            - name: 'Install & Deploy ServiceMax'
+              run: |
+                pwd
+                ls -l svmxc/
+                chmod -R a+rwx scripts
+                chmod 755 scripts/getchangedSVMXCfiles.sh 
+                scripts/getchangedSVMXCfiles.sh svmxc/
+                if [ -d "changed-sources-svmxc" ]; then
+                  echo "svmxc folder exists."
+                  if [ "$(ls -A changed-sources-svmxc)" ]; then
+                    echo "svmxc is not empty, installing sfdx servicemax plugin"
+                    echo y | sfdx plugins:install svmxc-sfdx
+                    #run: sfdx svmxc:deploy -f -p ./ -u integration --json --loglevel=trace
+                    sfdx svmxc:validate -p ./changed-sources-svmxc -u integration --json --loglevel=trace
+                  else
+                    echo "svmxc folder is empty."
+                  fi
+                else
+                  echo "svmxc folder does not exist."
+                fi              
